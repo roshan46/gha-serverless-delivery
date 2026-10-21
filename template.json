@@ -1,0 +1,128 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::Serverless-2016-10-31",
+  "Description": "Versioned sandbox Lambda with canary alarm rollback",
+  "Parameters": {
+    "Prefix": {
+      "Type": "String"
+    },
+    "ArtifactBucket": {
+      "Type": "String"
+    },
+    "ArtifactKey": {
+      "Type": "String"
+    },
+    "ReleaseId": {
+      "Type": "String"
+    },
+    "LambdaRoleArn": {
+      "Type": "String"
+    },
+    "CodeDeployRoleArn": {
+      "Type": "String"
+    },
+    "FailRelease": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "false",
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "Function": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-function"
+        },
+        "Runtime": "python3.13",
+        "Handler": "app.handler",
+        "CodeUri": {
+          "Bucket": {
+            "Ref": "ArtifactBucket"
+          },
+          "Key": {
+            "Ref": "ArtifactKey"
+          }
+        },
+        "Role": {
+          "Ref": "LambdaRoleArn"
+        },
+        "Timeout": 5,
+        "MemorySize": 128,
+        "AutoPublishAlias": "live",
+        "AutoPublishAliasAllProperties": true,
+        "Environment": {
+          "Variables": {
+            "RELEASE_ID": {
+              "Ref": "ReleaseId"
+            },
+            "FAIL_RELEASE": {
+              "Ref": "FailRelease"
+            }
+          }
+        },
+        "DeploymentPreference": {
+          "Type": "Canary10Percent5Minutes",
+          "Role": {
+            "Ref": "CodeDeployRoleArn"
+          },
+          "Alarms": [
+            {
+              "Ref": "Errors"
+            }
+          ]
+        }
+      }
+    },
+    "LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-function"
+        },
+        "RetentionInDays": 1
+      }
+    },
+    "Errors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Rollback on any alias error under controlled lab traffic",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Fn::Sub": "${Prefix}-function"
+            }
+          },
+          {
+            "Name": "Resource",
+            "Value": {
+              "Fn::Sub": "${Prefix}-function:live"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "FunctionName": {
+      "Value": {
+        "Ref": "Function"
+      }
+    },
+    "Alias": {
+      "Value": "live"
+    }
+  }
+}

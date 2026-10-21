@@ -1,0 +1,166 @@
+name: Serverless delivery
+on:
+  workflow_dispatch:
+    inputs:
+      fault:
+        description: Inject a sandbox canary failure after a successful baseline
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: serverless-delivery
+  cancel-in-progress: false
+jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+  build:
+    needs: security
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: python -m unittest discover -s tests -v
+      - run: bash scripts/install-tool.sh gitleaks
+      - run: bash scripts/install-tool.sh trivy
+      - run: gitleaks dir --redact .
+      - run: trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --exit-code 1 src
+      - name: Build once
+        run: |
+          mkdir release
+          cd src
+          zip ../release/function.zip app.py
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: release/function.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release
+          path: release/function.zip
+          retention-days: 7
+  development:
+    needs: build
+    environment: development
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      PREFIX: ${{ vars.PREFIX }}
+      LAMBDA_ROLE: ${{ vars.LAMBDA_ROLE_ARN }}
+      CODEDEPLOY_ROLE: ${{ vars.CODEDEPLOY_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+      - run: bash scripts/check-latest.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release
+          path: release
+      - name: Verify provenance against this workflow and commit
+        run: |
+          gh attestation verify release/function.zip --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/delivery.yml" --source-digest "$GITHUB_SHA"
+      - name: Upload immutable release bytes
+        run: |
+          sha256sum release/function.zip >> "$GITHUB_STEP_SUMMARY"
+          key="releases/$GITHUB_SHA/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/function.zip"
+          aws s3 cp release/function.zip "s3://$BUCKET/$key" --only-show-errors
+          echo "ARTIFACT_KEY=$key" >> "$GITHUB_ENV"
+      - name: Deploy and generate traffic during the canary
+        env:
+          FAULT: ${{ inputs.fault && 'true' || 'false' }}
+        run: |
+          python scripts/traffic.py "$PREFIX-function" 660 > "$RUNNER_TEMP/traffic.log" 2>&1 &
+          traffic_pid=$!
+          trap 'kill "$traffic_pid" 2>/dev/null || true' EXIT
+          aws cloudformation deploy --template-file template.json --stack-name "$PREFIX-app" --no-fail-on-empty-changeset --parameter-overrides "Prefix=$PREFIX" "ArtifactBucket=$BUCKET" "ArtifactKey=$ARTIFACT_KEY" "ReleaseId=$GITHUB_SHA" "LambdaRoleArn=$LAMBDA_ROLE" "CodeDeployRoleArn=$CODEDEPLOY_ROLE" "FailRelease=$FAULT"
+      - name: Verify live response belongs to this release
+        run: |
+          aws lambda invoke --function-name "$PREFIX-function" --qualifier live response.json > meta.json
+          jq -e 'has("FunctionError") | not' meta.json
+          jq -e --arg sha "$GITHUB_SHA" '.statusCode == 200 and .release == $sha' response.json
+      - name: Record deployment evidence
+        if: always()
+        run: |
+          aws cloudformation describe-stacks --stack-name "$PREFIX-app" --query 'Stacks[0].StackStatus' >> "$GITHUB_STEP_SUMMARY"
+          aws lambda get-alias --function-name "$PREFIX-function" --name live --query '{Version:FunctionVersion,Routing:RoutingConfig}' >> "$GITHUB_STEP_SUMMARY"
+
+  production:
+    needs: development
+    if: inputs.fault == false
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      PREFIX: ${{ vars.PREFIX }}
+      LAMBDA_ROLE: ${{ vars.LAMBDA_ROLE_ARN }}
+      CODEDEPLOY_ROLE: ${{ vars.CODEDEPLOY_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+      - run: bash scripts/check-latest.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release
+          path: release
+      - name: Verify provenance against this workflow and commit
+        run: |
+          gh attestation verify release/function.zip --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/delivery.yml" --source-digest "$GITHUB_SHA"
+      - name: Upload immutable release bytes
+        run: |
+          sha256sum release/function.zip >> "$GITHUB_STEP_SUMMARY"
+          key="releases/$GITHUB_SHA/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/function.zip"
+          aws s3 cp release/function.zip "s3://$BUCKET/$key" --only-show-errors
+          echo "ARTIFACT_KEY=$key" >> "$GITHUB_ENV"
+      - name: Deploy and generate traffic during the canary
+        env:
+          FAULT: 'false'
+        run: |
+          python scripts/traffic.py "$PREFIX-function" 660 > "$RUNNER_TEMP/traffic.log" 2>&1 &
+          traffic_pid=$!
+          trap 'kill "$traffic_pid" 2>/dev/null || true' EXIT
+          aws cloudformation deploy --template-file template.json --stack-name "$PREFIX-app" --no-fail-on-empty-changeset --parameter-overrides "Prefix=$PREFIX" "ArtifactBucket=$BUCKET" "ArtifactKey=$ARTIFACT_KEY" "ReleaseId=$GITHUB_SHA" "LambdaRoleArn=$LAMBDA_ROLE" "CodeDeployRoleArn=$CODEDEPLOY_ROLE" "FailRelease=$FAULT"
+      - name: Verify live response belongs to this release
+        run: |
+          aws lambda invoke --function-name "$PREFIX-function" --qualifier live response.json > meta.json
+          jq -e 'has("FunctionError") | not' meta.json
+          jq -e --arg sha "$GITHUB_SHA" '.statusCode == 200 and .release == $sha' response.json
+      - name: Record deployment evidence
+        if: always()
+        run: |
+          aws cloudformation describe-stacks --stack-name "$PREFIX-app" --query 'Stacks[0].StackStatus' >> "$GITHUB_STEP_SUMMARY"
+          aws lambda get-alias --function-name "$PREFIX-function" --name live --query '{Version:FunctionVersion,Routing:RoutingConfig}' >> "$GITHUB_STEP_SUMMARY"
+
